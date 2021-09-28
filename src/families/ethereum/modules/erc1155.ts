@@ -12,9 +12,9 @@ import type { Account } from "../../../types";
 
 const notOwnedNft = createCustomErrorClass("NotOwnedNft");
 
-export type Modes = "erc721.transfer";
+export type Modes = "erc1155.transfer";
 
-const erc721transfer: ModeModule = {
+const erc1155Transfer: ModeModule = {
   /**
    * Tx data is filled during the buildEthereumTx
    */
@@ -40,13 +40,13 @@ const erc721transfer: ModeModule = {
         result.errors.amount = new NotEnoughBalanceInParentAccount();
       }
 
-      if (
-        !a.nfts?.find?.(
-          (n) =>
-            n.tokenId === t.tokenIds?.[0] &&
-            n.collection.contract === t.collection
-        )
-      ) {
+      const tokensOwned = t.tokenIds?.reduce((acc, tokenId) => {
+        return acc
+          ? Boolean(a.nfts?.find((n) => n.tokenId === tokenId))
+          : false;
+      }, true);
+
+      if (!tokensOwned) {
         result.errors.amount = new notOwnedNft();
       }
     }
@@ -70,8 +70,14 @@ const erc721transfer: ModeModule = {
 
     fields.push({
       type: "text",
-      label: "Token ID",
-      value: input.transaction.tokenIds?.[0] ?? "",
+      label: "Token IDs",
+      value: input.transaction.tokenIds?.join(",") ?? "",
+    });
+
+    fields.push({
+      type: "text",
+      label: "Quantities",
+      value: input.transaction.quantities?.join(",") ?? "",
     });
   },
 
@@ -93,15 +99,18 @@ function serializeTransactionData(
 ): Buffer | null | undefined {
   const from = eip55.encode(account.freshAddress);
   const to = eip55.encode(transaction.recipient);
+  const tokenIds = transaction.tokenIds;
+  const quantities = transaction.quantities?.map((q) => q.toFixed());
 
   return abi.simpleEncode(
-    "safeTransferFrom(address,address,uint256)",
+    "safeBatchTransferFrom(address,address,uint256[],uint256[])",
     from,
     to,
-    transaction.tokenIds?.[0]
+    tokenIds,
+    quantities
   );
 }
 
 export const modes: Record<Modes, ModeModule> = {
-  "erc721.transfer": erc721transfer,
+  "erc1155.transfer": erc1155Transfer,
 };
