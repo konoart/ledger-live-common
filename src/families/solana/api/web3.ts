@@ -8,6 +8,7 @@ import {
   TransactionInstruction,
   AccountInfo,
   ParsedAccountData,
+  clusterApiUrl,
 } from "@solana/web3.js";
 import BigNumber from "bignumber.js";
 import _, { chain, chunk, flow, reduce, sortBy } from "lodash";
@@ -35,8 +36,8 @@ import {
 import { TokenAccountInfo } from "./validators/accounts/token";
 import { assertUnreachable } from "../utils";
 
-//const conn = new Connection(clusterApiUrl("mainnet-beta"), "finalized");
-const conn = new Connection("http://api.devnet.solana.com");
+const conn = new Connection(clusterApiUrl("mainnet-beta"), "finalized");
+//const conn = new Connection("http://api.devnet.solana.com");
 
 export const getBalance = (address: string) =>
   conn.getBalance(new PublicKey(address));
