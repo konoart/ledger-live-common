@@ -1,16 +1,15 @@
 import { ParsedAccountData } from "@solana/web3.js";
 import { create } from "superstruct";
 import { ParsedInfo } from "../validators";
-import { TokenAccount, TokenAccountInfo } from "../validators/accounts/token";
+import { TokenAccount, TokenAccountInfo } from "./token";
 
-export function parseTokenAccountInfo(info: unknown): TokenAccountInfo | Error {
-  const routine = () => {
-    return create(info, TokenAccountInfo);
-  };
-  return onThrowReturnError(routine);
+export function parseTokenAccountInfo(info: unknown): TokenAccountInfo {
+  return create(info, TokenAccountInfo);
 }
 
-export function tryParseAsTokenAccount(data: ParsedAccountData) {
+export function tryParseAsTokenAccount(
+  data: ParsedAccountData
+): TokenAccountInfo | undefined | Error {
   const routine = () => {
     const info = create(data.parsed, ParsedInfo);
 

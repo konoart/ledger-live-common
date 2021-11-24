@@ -1,25 +1,16 @@
 import { BigNumber } from "bignumber.js";
-import type {
-  CommandDescriptor,
-  Transaction /* TransactionMode */,
-} from "./types";
-import { log } from "@ledgerhq/logs";
-import { Account, AccountLike } from "../../types";
+import type { Transaction /* TransactionMode */ } from "./types";
+import { Account } from "../../types";
 
-/**
- * Create an empty transaction
- *
- * @returns {Transaction}
- */
-const createTransaction = (mainAccount: Account): Transaction => {
+const createTransaction = (_: Account): Transaction => {
   return {
     family: "solana",
     amount: new BigNumber(0),
     recipient: "",
-    state: {
-      kind: "unprepared",
-      mode: {
-        kind: "transfer",
+    model: {
+      kind: "transfer",
+      uiState: {
+        memo: undefined,
       },
     },
   };
@@ -31,12 +22,5 @@ export const updateTransaction = (
 ): Transaction => {
   return { ...t, ...patch };
 };
-
-function switchExpr<T extends string | number, S>(
-  value: T,
-  record: Record<T, S>
-) {
-  return record[value];
-}
 
 export default createTransaction;

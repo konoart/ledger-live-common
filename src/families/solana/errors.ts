@@ -1,7 +1,6 @@
 import { createCustomErrorClass } from "@ledgerhq/errors";
 
-// TODO: rename to wallet ?
-export const SolanaMainAccountNotFunded = createCustomErrorClass(
+export const SolanaAccountNotFunded = createCustomErrorClass(
   "SolanaAccountNotFunded"
 );
 
@@ -16,12 +15,12 @@ export const SolanaMemoIsTooLong = createCustomErrorClass(
   "SolanaMemoIsTooLong"
 );
 
-export const SolanaAmountNotTransferableIn1Tx = createCustomErrorClass(
-  "SolanaAmountNotTransferableIn1Tx"
-);
-
 export const SolanaTokenAccountHoldsAnotherToken = createCustomErrorClass(
   "SolanaTokenAccountHoldsAnotherToken"
+);
+
+export const SolanaTokenAccounNotInitialized = createCustomErrorClass(
+  "SolanaTokenAccounNotInitialized"
 );
 
 export const SolanaAddressOffEd25519 = createCustomErrorClass(

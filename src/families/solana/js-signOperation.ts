@@ -1,9 +1,13 @@
 import { Observable } from "rxjs";
-import type { Account, Operation, SignOperationEvent } from "../../types";
+import type {
+  Account,
+  Operation,
+  OperationType,
+  SignOperationEvent,
+} from "../../types";
 import { open, close } from "../../hw";
 import type {
-  Command,
-  CreateAssociatedTokenAccountCommand,
+  TokenCreateATACommand,
   TokenTransferCommand,
   Transaction,
   TransferCommand,
@@ -13,32 +17,30 @@ import { buildOnChainTransaction } from "./js-buildTransaction";
 import Solana from "@ledgerhq/hw-app-solana";
 import BigNumber from "bignumber.js";
 import { encodeOperationId } from "../../operation";
-import { assertUnreachable } from "./utils";
+import { assertUnreachable, clusterByCurrencyId } from "./utils";
+import { Config } from "./api";
 
-const buildOptimisticOperation = async (
+const buildOptimisticOperation = (
   account: Account,
   transaction: Transaction
-): Promise<Operation> => {
-  const { state } = transaction;
-  switch (state.kind) {
-    case "prepared":
-      const { commandDescriptor } = state;
-      switch (commandDescriptor.status) {
-        case "valid":
-          return buildOptimisticOperationForCommand(
-            account,
-            transaction,
-            commandDescriptor
-          );
-        case "invalid":
-          throw new Error("unexpected transaction state");
-        default:
-          assertUnreachable(commandDescriptor);
-      }
-    case "unprepared":
-      throw new Error("unexpected transaction state");
+): Operation => {
+  if (transaction.model.commandDescriptor === undefined) {
+    throw new Error("command descriptor is missing");
+  }
+
+  const { commandDescriptor } = transaction.model;
+
+  switch (commandDescriptor.status) {
+    case "valid":
+      return buildOptimisticOperationForCommand(
+        account,
+        transaction,
+        commandDescriptor
+      );
+    case "invalid":
+      throw new Error("invalid command");
     default:
-      return assertUnreachable(state);
+      return assertUnreachable(commandDescriptor);
   }
 };
 
@@ -58,9 +60,13 @@ const signOperation = ({
     const main = async () => {
       const transport = await open(deviceId);
 
+      const config: Config = {
+        cluster: clusterByCurrencyId(account.currency.id),
+      };
+
       try {
         const [msgToHardwareBytes, singOnChainTransaction] =
-          await buildOnChainTransaction(account, transaction);
+          await buildOnChainTransaction(account, transaction, config);
 
         const hwApp = new Solana(transport);
 
@@ -82,7 +88,7 @@ const signOperation = ({
         subsriber.next({
           type: "signed",
           signedOperation: {
-            operation: await buildOptimisticOperation(account, transaction),
+            operation: buildOptimisticOperation(account, transaction),
             signature: singedOnChainTxBytes.toString("hex"),
             expirationDate: null,
           },
@@ -99,41 +105,45 @@ const signOperation = ({
   });
 
 export default signOperation;
+
 function buildOptimisticOperationForCommand(
   account: Account,
   transaction: Transaction,
-  commandDescriptor: ValidCommandDescriptor<Command>
+  commandDescriptor: ValidCommandDescriptor
 ): Operation {
-  switch (commandDescriptor.command.kind) {
+  const { command } = commandDescriptor;
+  switch (command.kind) {
     case "transfer":
       return optimisticOpForTransfer(
         account,
         transaction,
-        commandDescriptor as ValidCommandDescriptor<TransferCommand>
+        command,
+        commandDescriptor
       );
     case "token.transfer":
       return optimisticOpForTokenTransfer(
         account,
         transaction,
-        commandDescriptor as ValidCommandDescriptor<TokenTransferCommand>
+        command,
+        commandDescriptor
       );
-    case "token.createAssociatedTokenAccount":
-      type command = CreateAssociatedTokenAccountCommand;
+    case "token.createATA":
       return optimisticOpForCATA(
         account,
         transaction,
-        commandDescriptor as ValidCommandDescriptor<command>
+        command,
+        commandDescriptor
       );
     default:
-      return assertUnreachable(commandDescriptor.command);
+      return assertUnreachable(command);
   }
 }
 function optimisticOpForTransfer(
   account: Account,
   transaction: Transaction,
-  commandDescriptor: ValidCommandDescriptor<TransferCommand>
+  command: TransferCommand,
+  commandDescriptor: ValidCommandDescriptor
 ): Operation {
-  const { command } = commandDescriptor;
   return {
     ...optimisticOpcommons(transaction, commandDescriptor),
     id: encodeOperationId(account.id, "", "OUT"),
@@ -151,12 +161,12 @@ function optimisticOpForTransfer(
 function optimisticOpForTokenTransfer(
   account: Account,
   transaction: Transaction,
-  commandDescriptor: ValidCommandDescriptor<TokenTransferCommand>
+  command: TokenTransferCommand,
+  commandDescriptor: ValidCommandDescriptor
 ): Operation {
   if (!transaction.subAccountId) {
     throw new Error("sub account id is required for token transfer");
   }
-  const { command } = commandDescriptor;
   return {
     ...optimisticOpcommons(transaction, commandDescriptor),
     id: encodeOperationId(account.id, "", "FEES"),
@@ -188,22 +198,25 @@ function optimisticOpForTokenTransfer(
 function optimisticOpForCATA(
   account: Account,
   transaction: Transaction,
-  commandDescriptor: ValidCommandDescriptor<CreateAssociatedTokenAccountCommand>
+  _: TokenCreateATACommand,
+  commandDescriptor: ValidCommandDescriptor
 ): Operation {
+  const opType: OperationType = "OPT_IN";
+
   return {
     ...optimisticOpcommons(transaction, commandDescriptor),
-    id: encodeOperationId(account.id, "", "FEES"),
-    type: "FEES",
+    id: encodeOperationId(account.id, "", opType),
+    type: opType,
     accountId: account.id,
-    senders: [account.freshAddress],
-    recipients: [transaction.recipient],
+    senders: [],
+    recipients: [],
     value: new BigNumber(commandDescriptor.fees ?? 0),
   };
 }
 
 function optimisticOpcommons(
   transaction: Transaction,
-  commandDescriptor: ValidCommandDescriptor<Command>
+  commandDescriptor: ValidCommandDescriptor
 ) {
   if (!transaction.feeCalculator) {
     throw new Error("fee calculator is not loaded");

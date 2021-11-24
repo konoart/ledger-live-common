@@ -1,4 +1,4 @@
-import { findTokenById, getTokenById } from "@ledgerhq/cryptoassets";
+import { getTokenById } from "@ledgerhq/cryptoassets";
 import {
   AmountRequired,
   InvalidAddress,
@@ -6,31 +6,26 @@ import {
   NotEnoughBalance,
   RecipientRequired,
 } from "@ledgerhq/errors";
-import { sum } from "lodash";
 import { findSubAccountById } from "../../account";
-import type { Account, TokenAccount } from "../../types";
+import type { Account } from "../../types";
 import {
-  getNetworkInfo,
-  getOnChainTokenAccountsByMint,
   findAssociatedTokenAccountPubkey,
-  getTokenTransferSpec,
   getTxFeeCalculator,
   getMaybeTokenAccount,
   getAssociatedTokenAccountCreationFee,
-  getBalance,
+  Config,
 } from "./api";
 import {
-  SolanaMainAccountNotFunded,
+  SolanaAccountNotFunded,
   SolanaAddressOffEd25519,
   SolanaMemoIsTooLong,
-  SolanaAmountNotTransferableIn1Tx,
   SolanaTokenAccountHoldsAnotherToken,
   SolanaRecipientAssociatedTokenAccountWillBeFunded,
   SolanaNotEnoughBalanceToPayFees,
   SolanaTokenRecipientIsSenderATA,
+  SolanaTokenAccounNotInitialized,
 } from "./errors";
 import {
-  Awaited,
   decodeAccountIdWithTokenAccountAddress,
   isAccountFunded,
   isEd25519Address,
@@ -39,29 +34,26 @@ import {
 } from "./logic";
 
 import type {
-  AncillaryTokenAccountOperation,
-  Command,
   CommandDescriptor,
-  PreparedTransactionState,
-  CreateAssociatedTokenAccountCommand,
+  TokenCreateATATransaction,
   TokenRecipientDescriptor,
-  TokenTransferCommand,
+  TokenTransferTransaction,
   Transaction,
-  TransferCommand,
-  UnpreparedCreateAssociatedTokenAccountTransactionMode,
-  UnpreparedTokenTransferTransactionMode,
-  UnpreparedTransactionMode,
-  UnpreparedTransferTransactionMode,
+  TransactionModel,
+  TransferTransaction,
 } from "./types";
-import { assertUnreachable } from "./utils";
+import { assertUnreachable, clusterByCurrencyId } from "./utils";
 
 async function deriveCommandDescriptor(
   mainAccount: Account,
   tx: Transaction,
-  mode: UnpreparedTransactionMode
-): Promise<CommandDescriptor<Command>> {
+  config: Config
+): Promise<CommandDescriptor> {
   const errors: Record<string, Error> = {};
-  switch (mode.kind) {
+
+  const { model } = tx;
+
+  switch (model.kind) {
     case "transfer":
     case "token.transfer":
       if (!tx.recipient) {
@@ -72,26 +64,30 @@ async function deriveCommandDescriptor(
         errors.recipient = new InvalidAddress();
       }
 
-      if (mode.memo && mode.memo.length > MAX_MEMO_LENGTH) {
-        errors.memo = errors.memo = new SolanaMemoIsTooLong(undefined, {
-          maxLength: MAX_MEMO_LENGTH,
-        });
+      if (model.uiState.memo) {
+        const encoder = new TextEncoder();
+        if (encoder.encode(model.uiState.memo).byteLength > MAX_MEMO_LENGTH) {
+          errors.memo = errors.memo = new SolanaMemoIsTooLong(undefined, {
+            maxLength: MAX_MEMO_LENGTH,
+          });
+        }
       }
 
       if (Object.keys(errors).length > 0) {
         return toInvalidStatusCommand(errors);
       }
 
-      return mode.kind === "transfer"
-        ? deriveTransaferCommandDescriptor(mainAccount, tx, mode)
-        : deriveTokenTransferDescriptor(mainAccount, tx, mode);
-    case "token.createAssociatedTokenAccount":
+      return model.kind === "transfer"
+        ? deriveTransaferCommandDescriptor(mainAccount, tx, model, config)
+        : deriveTokenTransferCommandDescriptor(mainAccount, tx, model, config);
+    case "token.createATA":
       return deriveCreateAssociatedTokenAccountCommandDescriptor(
         mainAccount,
-        mode
+        model,
+        config
       );
     default:
-      return assertUnreachable(mode);
+      return assertUnreachable(model);
   }
 }
 
@@ -102,18 +98,22 @@ const prepareTransaction = async (
   const patch: Partial<Transaction> = {};
   const errors: Record<string, Error> = {};
 
-  const feeCalculator = tx.feeCalculator ?? (await getTxFeeCalculator());
+  const config: Config = {
+    cluster: clusterByCurrencyId(mainAccount.currency.id),
+  };
+
+  const feeCalculator = tx.feeCalculator ?? (await getTxFeeCalculator(config));
 
   if (tx.feeCalculator === undefined) {
     patch.feeCalculator = feeCalculator;
   }
 
-  const mode = deriveMode(tx);
+  const txToDeriveFrom = updateModelIfSubAccountIdPresent(tx);
 
   const commandDescriptor = await deriveCommandDescriptor(
     mainAccount,
-    tx,
-    mode
+    txToDeriveFrom,
+    config
   );
 
   if (commandDescriptor.status === "invalid") {
@@ -127,27 +127,28 @@ const prepareTransaction = async (
 
   const command = commandDescriptor.command;
   switch (command.kind) {
-    case "transfer":
-      // TODO: SWITCH TO BIGNUMBER!!!!!
+    case "transfer": {
       const totalSpend = command.amount + feeCalculator.lamportsPerSignature;
       if (mainAccount.balance.lt(totalSpend)) {
         errors.amount = new NotEnoughBalance();
       }
       break;
-    default:
+    }
+    default: {
       const totalFees =
         feeCalculator.lamportsPerSignature + (commandDescriptor.fees ?? 0);
       if (mainAccount.balance.lt(totalFees)) {
         errors.amount = new SolanaNotEnoughBalanceToPayFees();
       }
+    }
   }
 
   if (Object.keys(errors).length > 0) {
     return toInvalidTx(tx, patch, errors);
   }
 
-  patch.state = {
-    kind: "prepared",
+  patch.model = {
+    ...tx.model,
     commandDescriptor,
   };
 
@@ -159,15 +160,19 @@ const prepareTransaction = async (
     : tx;
 };
 
-const deriveTokenTransferDescriptor = async (
+const deriveTokenTransferCommandDescriptor = async (
   mainAccount: Account,
   tx: Transaction,
-  mode: UnpreparedTokenTransferTransactionMode
-): Promise<CommandDescriptor<TokenTransferCommand>> => {
+  model: TransactionModel & { kind: TokenTransferTransaction["kind"] },
+  config: Config
+): Promise<CommandDescriptor> => {
   const errors: Record<string, Error> = {};
   const warnings: Record<string, Error> = {};
-  // TODO: check all info if changed = revalidate
-  const subAccount = findSubAccountById(mainAccount, mode.subAccountId);
+
+  const subAccount = findSubAccountById(
+    mainAccount,
+    model.uiState.subAccountId
+  );
   if (!subAccount || subAccount.type !== "TokenAccount") {
     throw new Error("subaccount not found");
   }
@@ -186,7 +191,8 @@ const deriveTokenTransferDescriptor = async (
 
   const recipientDescriptor = await getTokenRecipient(
     tx.recipient,
-    mintAddress
+    mintAddress,
+    config
   );
 
   if (recipientDescriptor instanceof Error) {
@@ -195,15 +201,15 @@ const deriveTokenTransferDescriptor = async (
   }
 
   const fees = recipientDescriptor.shouldCreateAsAssociatedTokenAccount
-    ? await getAssociatedTokenAccountCreationFee()
+    ? await getAssociatedTokenAccountCreationFee(config)
     : 0;
 
   if (recipientDescriptor.shouldCreateAsAssociatedTokenAccount) {
     warnings.recipientAssociatedTokenAccount =
       new SolanaRecipientAssociatedTokenAccountWillBeFunded();
 
-    if (!(await isAccountFunded(tx.recipient))) {
-      warnings.recipient = new SolanaMainAccountNotFunded();
+    if (!(await isAccountFunded(tx.recipient, config))) {
+      warnings.recipient = new SolanaAccountNotFunded();
     }
   }
 
@@ -221,32 +227,6 @@ const deriveTokenTransferDescriptor = async (
     return toInvalidStatusCommand(errors, warnings);
   }
 
-  // TODO: remove total balance
-  const {
-    totalBalance,
-    totalTransferableAmountIn1Tx,
-    ancillaryTokenAccOps: ownerAncillaryTokenAccOps,
-  } = await getTokenTransferSpec(
-    mainAccount.freshAddress,
-    senderAssociatedTokenAccountAddress,
-    mintAddress,
-    recipientDescriptor,
-    txAmount,
-    mintDecimals
-  );
-
-  if (ownerAncillaryTokenAccOps.length > 0) {
-    //TODO: think of it...
-    warnings.ancillaryOps = new Error(
-      JSON.stringify(ownerAncillaryTokenAccOps)
-    );
-  }
-
-  if (txAmount > totalTransferableAmountIn1Tx) {
-    errors.amount = new SolanaAmountNotTransferableIn1Tx();
-    return toInvalidStatusCommand(errors, warnings);
-  }
-
   return {
     status: "valid",
     command: {
@@ -254,11 +234,10 @@ const deriveTokenTransferDescriptor = async (
       ownerAddress: mainAccount.freshAddress,
       ownerAssociatedTokenAccountAddress: senderAssociatedTokenAccountAddress,
       amount: txAmount,
-      ownerAncillaryTokenAccOps,
       mintAddress,
       mintDecimals,
       recipientDescriptor: recipientDescriptor,
-      memo: mode.memo,
+      memo: model.uiState.memo,
     },
     fees,
     warnings,
@@ -267,9 +246,13 @@ const deriveTokenTransferDescriptor = async (
 
 async function getTokenRecipient(
   recipientAddress: string,
-  mintAddress: string
+  mintAddress: string,
+  config: Config
 ): Promise<TokenRecipientDescriptor | Error> {
-  const recipientTokenAccount = await getMaybeTokenAccount(recipientAddress);
+  const recipientTokenAccount = await getMaybeTokenAccount(
+    recipientAddress,
+    config
+  );
 
   if (recipientTokenAccount instanceof Error) {
     throw recipientTokenAccount;
@@ -277,7 +260,7 @@ async function getTokenRecipient(
 
   if (recipientTokenAccount === undefined) {
     if (!isEd25519Address(recipientAddress)) {
-      return new InvalidAddress();
+      return new SolanaAddressOffEd25519();
     }
 
     const recipientAssociatedTokenAccPubkey =
@@ -286,9 +269,9 @@ async function getTokenRecipient(
     const recipientAssociatedTokenAccountAddress =
       recipientAssociatedTokenAccPubkey.toBase58();
 
-    // TODO: check that acc exists instead?
     const shouldCreateAsAssociatedTokenAccount = !(await isAccountFunded(
-      recipientAssociatedTokenAccountAddress
+      recipientAssociatedTokenAccountAddress,
+      config
     ));
 
     return {
@@ -296,8 +279,13 @@ async function getTokenRecipient(
       shouldCreateAsAssociatedTokenAccount,
       tokenAccAddress: recipientAssociatedTokenAccountAddress,
     };
-  } else if (recipientTokenAccount.mint.toBase58() !== mintAddress) {
-    return new SolanaTokenAccountHoldsAnotherToken();
+  } else {
+    if (recipientTokenAccount.mint.toBase58() !== mintAddress) {
+      return new SolanaTokenAccountHoldsAnotherToken();
+    }
+    if (recipientTokenAccount.state !== "initialized") {
+      return new SolanaTokenAccounNotInitialized();
+    }
   }
 
   return {
@@ -309,21 +297,30 @@ async function getTokenRecipient(
 
 async function deriveCreateAssociatedTokenAccountCommandDescriptor(
   mainAccount: Account,
-  mode: UnpreparedCreateAssociatedTokenAccountTransactionMode
-): Promise<CommandDescriptor<CreateAssociatedTokenAccountCommand>> {
-  const token = getTokenById(mode.tokenId);
+  model: TransactionModel & { kind: TokenCreateATATransaction["kind"] },
+  config: Config
+): Promise<CommandDescriptor> {
+  const token = getTokenById(model.uiState.tokenId);
   const tokenIdParts = token.id.split("/");
   const mint = tokenIdParts[tokenIdParts.length - 1];
 
-  const fees = await getAssociatedTokenAccountCreationFee();
+  const associatedTokenAccountPubkey = await findAssociatedTokenAccountPubkey(
+    mainAccount.freshAddress,
+    mint
+  );
+
+  const associatedTokenAccountAddress = associatedTokenAccountPubkey.toBase58();
+
+  const fees = await getAssociatedTokenAccountCreationFee(config);
 
   return {
     status: "valid",
     fees,
     command: {
-      kind: mode.kind,
+      kind: model.kind,
       mint: mint,
       owner: mainAccount.freshAddress,
+      associatedTokenAccountAddress,
     },
   };
 }
@@ -331,20 +328,22 @@ async function deriveCreateAssociatedTokenAccountCommandDescriptor(
 async function deriveTransaferCommandDescriptor(
   mainAccount: Account,
   tx: Transaction,
-  mode: UnpreparedTransferTransactionMode
-): Promise<CommandDescriptor<TransferCommand>> {
+  model: TransactionModel & { kind: TransferTransaction["kind"] },
+  config: Config
+): Promise<CommandDescriptor> {
   const errors: Record<string, Error> = {};
   const warnings: Record<string, Error> = {};
 
   if (!isEd25519Address(tx.recipient)) {
-    errors.recipient = new SolanaAddressOffEd25519();
-    return toInvalidStatusCommand(errors, warnings);
+    warnings.recipientOffCurve = new SolanaAddressOffEd25519();
   }
 
-  // TODO: check if need to run validation again, recipient changed etc..
-  const recipientWalletIsUnfunded = !(await isAccountFunded(tx.recipient));
+  const recipientWalletIsUnfunded = !(await isAccountFunded(
+    tx.recipient,
+    config
+  ));
   if (recipientWalletIsUnfunded) {
-    warnings.recipient = new SolanaMainAccountNotFunded();
+    warnings.recipient = new SolanaAccountNotFunded();
   }
 
   if (!tx.useAllAmount && tx.amount.lte(0)) {
@@ -366,7 +365,7 @@ async function deriveTransaferCommandDescriptor(
       sender: mainAccount.freshAddress,
       recipient: tx.recipient,
       amount: txAmount.toNumber(),
-      memo: mode.memo,
+      memo: model.uiState.memo,
     },
     warnings: Object.keys(warnings).length > 0 ? warnings : undefined,
   };
@@ -381,8 +380,8 @@ function toInvalidTx(
   return {
     ...tx,
     ...patch,
-    state: {
-      kind: "prepared",
+    model: {
+      ...tx.model,
       commandDescriptor: toInvalidStatusCommand(errors, warnings),
     },
   };
@@ -399,22 +398,22 @@ function toInvalidStatusCommand(
   };
 }
 
-function deriveMode(tx: Transaction): UnpreparedTransactionMode {
-  switch (tx.state.kind) {
-    case "prepared":
-      return tx.subAccountId
-        ? {
-            kind: "token.transfer",
-            subAccountId: tx.subAccountId,
-          }
-        : {
-            kind: "transfer",
-          };
-    case "unprepared":
-      return tx.state.mode;
-    default:
-      return assertUnreachable(tx.state);
+// if subaccountid present - it's a token transfer
+function updateModelIfSubAccountIdPresent(tx: Transaction): Transaction {
+  if (tx.subAccountId) {
+    return {
+      ...tx,
+      model: {
+        kind: "token.transfer",
+        uiState: {
+          ...tx.model.uiState,
+          subAccountId: tx.subAccountId,
+        },
+      },
+    };
   }
+
+  return tx;
 }
 
 export default prepareTransaction;
