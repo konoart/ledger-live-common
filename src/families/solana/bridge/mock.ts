@@ -1,131 +1,63 @@
-import { BigNumber } from "bignumber.js";
-import {
-  NotEnoughBalance,
-  RecipientRequired,
-  InvalidAddress,
-  FeeTooHigh,
-} from "@ledgerhq/errors";
-import type { Transaction } from "../types";
-import type {
-  Account,
-  AccountBridge,
-  AccountLike,
-  CurrencyBridge,
-} from "../../../types";
-import {
-  scanAccounts,
-  signOperation,
-  broadcast,
-  sync,
-  isInvalidRecipient,
-} from "../../../bridge/mockHelpers";
-import { getMainAccount } from "../../../account";
-import { makeAccountBridgeReceive } from "../../../bridge/mockHelpers";
+import { flow, isArray, isEqual, isObject } from "lodash/fp";
+import { isUndefined, mapValues, omitBy } from "lodash/fp";
+import { cached, ChainAPI, Config, getChainAPI, logged, queued } from "../api";
+import { makeBridges } from "./bridge";
+import { makeLRUCache } from "../../../cache";
+import { getMockedMethods } from "./mock-data";
+import { minutes } from "../api/cached";
 
-const receive = makeAccountBridgeReceive();
+function getMockedAPI(config: Config): Promise<ChainAPI> {
+  const mockedMethods = getMockedMethods();
+  const api = new Proxy(
+    { config },
+    {
+      get(_, propKey) {
+        if (propKey in api) {
+          return api[propKey];
+        }
+        if (propKey === "then") {
+          return undefined;
+        }
+        const method = propKey.toString();
+        const mocks = mockedMethods.filter((mock) => mock.method === method);
+        if (mocks.length === 0) {
+          throw new Error(`no mock found for api method: ${method}`);
+        }
+        return function (...args: any[]) {
+          const definedArgs = removeUndefineds(args);
+          const mock = mocks.find(({ params }) => isEqual(definedArgs)(params));
+          if (mock === undefined) {
+            const argsJson = JSON.stringify(args);
+            throw new Error(
+              `no mock found for api method ${method} with args ${argsJson}`
+            );
+          }
+          return Promise.resolve(mock.answer);
+        };
+      },
+    }
+  );
+  return Promise.resolve(api as ChainAPI);
+}
 
-const createTransaction = (): Transaction => ({
-  //mode: { kind: "native" },
-  family: "solana",
-  amount: new BigNumber(0),
-  recipient: "",
-  model: {
-    kind: "transfer",
-    uiState: { memo: undefined },
-  },
-});
+function removeUndefineds(input: any) {
+  return isObject(input)
+    ? isArray(input)
+      ? input.map(removeUndefineds)
+      : flow(omitBy(isUndefined), mapValues(removeUndefineds))(input)
+    : input;
+}
 
-const updateTransaction = (
-  t: Transaction,
-  patch: Partial<Transaction>
-): Transaction => ({
-  ...t,
-  ...patch,
-});
+/* eslint-disable @typescript-eslint/no-unused-vars */
+const createMockForApi = makeLRUCache(
+  (config: Config) =>
+    Promise.resolve(
+      cached(queued(logged(getChainAPI(config), "/tmp/log"), 100))
+      //queued(logged(getChainAPI(config), "/tmp/log"), 100)
+    ),
+  (config) => config.cluster,
+  minutes(1000)
+);
 
-const prepareTransaction = async (
-  _: Account,
-  t: Transaction
-): Promise<Transaction> => ({
-  ...t,
-});
-
-const estimateMaxSpendable = async ({
-  account,
-  parentAccount,
-}: {
-  account: AccountLike;
-  parentAccount: Account;
-  transaction: Transaction;
-}): Promise<BigNumber> => {
-  const mainAccount = getMainAccount(account, parentAccount);
-  const estimatedFees = new BigNumber(5000);
-  return BigNumber.max(0, mainAccount.balance.minus(estimatedFees));
-};
-
-const getTransactionStatus = (
-  account: Account,
-  t: Transaction
-): Promise<{
-  errors: Record<string, Error>;
-  warnings: Record<string, Error>;
-  estimatedFees: BigNumber;
-  amount: BigNumber;
-  totalSpent: BigNumber;
-}> => {
-  const errors: any = {};
-  const warnings: any = {};
-  const useAllAmount = !!t.useAllAmount;
-
-  const estimatedFees = new BigNumber(5000);
-
-  const totalSpent = useAllAmount
-    ? account.balance
-    : new BigNumber(t.amount).plus(estimatedFees);
-
-  const amount = useAllAmount
-    ? account.balance.minus(estimatedFees)
-    : new BigNumber(t.amount);
-
-  if (amount.gt(0) && estimatedFees.times(10).gt(amount)) {
-    warnings.amount = new FeeTooHigh();
-  }
-
-  if (totalSpent.gt(account.balance)) {
-    errors.amount = new NotEnoughBalance();
-  }
-
-  if (!t.recipient) {
-    errors.recipient = new RecipientRequired();
-  } else if (isInvalidRecipient(t.recipient)) {
-    errors.recipient = new InvalidAddress();
-  }
-
-  return Promise.resolve({
-    errors,
-    warnings,
-    estimatedFees,
-    amount,
-    totalSpent,
-  });
-};
-
-const accountBridge: AccountBridge<Transaction> = {
-  estimateMaxSpendable,
-  createTransaction,
-  updateTransaction,
-  getTransactionStatus,
-  prepareTransaction,
-  sync,
-  receive,
-  signOperation,
-  broadcast,
-};
-
-const currencyBridge: CurrencyBridge = {
-  scanAccounts,
-  preload: async (_: any) => ({} as any),
-  hydrate: () => {},
-};
-
-export default { currencyBridge, accountBridge };
+//export default makeBridges(createMockForApi);
+export default makeBridges(getMockedAPI);

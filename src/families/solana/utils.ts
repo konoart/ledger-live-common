@@ -33,3 +33,50 @@ export function clusterByCurrencyId(currencyId: string): Cluster {
     `unexpected currency id format <${currencyId}>, should be like solana[_(testnet | devnet)]`
   );
 }
+
+type AsyncQueueEntry<T> = {
+  lazyPromise: () => Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: any) => void;
+};
+
+export function asyncQueue(config: { delayBetweenRuns: number }): {
+  submit: <T>(fn: () => Promise<T>) => Promise<T>;
+} {
+  const { delayBetweenRuns } = config;
+  const q: AsyncQueueEntry<any>[] = [];
+
+  const drain = async () => {
+    if (q.length > 0) {
+      const { lazyPromise, resolve, reject } = q[q.length - 1];
+      try {
+        resolve(await lazyPromise());
+      } catch (e) {
+        reject(e);
+      } finally {
+        void setTimeout(() => {
+          q.pop();
+          void drain();
+        }, delayBetweenRuns);
+      }
+    }
+  };
+
+  const submit = <T>(lazyPromise: () => Promise<T>): Promise<T> => {
+    return new Promise((resolve, reject) => {
+      q.unshift({
+        lazyPromise,
+        resolve,
+        reject,
+      });
+
+      if (q.length === 1) {
+        void drain();
+      }
+    });
+  };
+
+  return {
+    submit,
+  };
+}

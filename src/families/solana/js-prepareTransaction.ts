@@ -8,13 +8,8 @@ import {
 } from "@ledgerhq/errors";
 import { findSubAccountById } from "../../account";
 import type { Account } from "../../types";
-import {
-  findAssociatedTokenAccountPubkey,
-  getTxFeeCalculator,
-  getMaybeTokenAccount,
-  getAssociatedTokenAccountCreationFee,
-  Config,
-} from "./api";
+import { ChainAPI } from "./api";
+import { getMaybeTokenAccount } from "./api/chain/web3";
 import {
   SolanaAccountNotFunded,
   SolanaAddressOffEd25519,
@@ -27,7 +22,6 @@ import {
 } from "./errors";
 import {
   decodeAccountIdWithTokenAccountAddress,
-  isAccountFunded,
   isEd25519Address,
   isValidBase58Address,
   MAX_MEMO_LENGTH,
@@ -42,12 +36,12 @@ import type {
   TransactionModel,
   TransferTransaction,
 } from "./types";
-import { assertUnreachable, clusterByCurrencyId } from "./utils";
+import { assertUnreachable } from "./utils";
 
 async function deriveCommandDescriptor(
   mainAccount: Account,
   tx: Transaction,
-  config: Config
+  api: ChainAPI
 ): Promise<CommandDescriptor> {
   const errors: Record<string, Error> = {};
 
@@ -78,13 +72,13 @@ async function deriveCommandDescriptor(
       }
 
       return model.kind === "transfer"
-        ? deriveTransaferCommandDescriptor(mainAccount, tx, model, config)
-        : deriveTokenTransferCommandDescriptor(mainAccount, tx, model, config);
+        ? deriveTransaferCommandDescriptor(mainAccount, tx, model, api)
+        : deriveTokenTransferCommandDescriptor(mainAccount, tx, model, api);
     case "token.createATA":
       return deriveCreateAssociatedTokenAccountCommandDescriptor(
         mainAccount,
         model,
-        config
+        api
       );
     default:
       return assertUnreachable(model);
@@ -93,16 +87,13 @@ async function deriveCommandDescriptor(
 
 const prepareTransaction = async (
   mainAccount: Account,
-  tx: Transaction
+  tx: Transaction,
+  api: ChainAPI
 ): Promise<Transaction> => {
   const patch: Partial<Transaction> = {};
   const errors: Record<string, Error> = {};
 
-  const config: Config = {
-    cluster: clusterByCurrencyId(mainAccount.currency.id),
-  };
-
-  const feeCalculator = tx.feeCalculator ?? (await getTxFeeCalculator(config));
+  const feeCalculator = tx.feeCalculator ?? (await getTxFeeCalculator(api));
 
   if (tx.feeCalculator === undefined) {
     patch.feeCalculator = feeCalculator;
@@ -113,7 +104,7 @@ const prepareTransaction = async (
   const commandDescriptor = await deriveCommandDescriptor(
     mainAccount,
     txToDeriveFrom,
-    config
+    api
   );
 
   if (commandDescriptor.status === "invalid") {
@@ -164,7 +155,7 @@ const deriveTokenTransferCommandDescriptor = async (
   mainAccount: Account,
   tx: Transaction,
   model: TransactionModel & { kind: TokenTransferTransaction["kind"] },
-  config: Config
+  api: ChainAPI
 ): Promise<CommandDescriptor> => {
   const errors: Record<string, Error> = {};
   const warnings: Record<string, Error> = {};
@@ -173,6 +164,7 @@ const deriveTokenTransferCommandDescriptor = async (
     mainAccount,
     model.uiState.subAccountId
   );
+
   if (!subAccount || subAccount.type !== "TokenAccount") {
     throw new Error("subaccount not found");
   }
@@ -192,7 +184,7 @@ const deriveTokenTransferCommandDescriptor = async (
   const recipientDescriptor = await getTokenRecipient(
     tx.recipient,
     mintAddress,
-    config
+    api
   );
 
   if (recipientDescriptor instanceof Error) {
@@ -201,14 +193,14 @@ const deriveTokenTransferCommandDescriptor = async (
   }
 
   const fees = recipientDescriptor.shouldCreateAsAssociatedTokenAccount
-    ? await getAssociatedTokenAccountCreationFee(config)
+    ? await api.getAssocTokenAccMinNativeBalance()
     : 0;
 
   if (recipientDescriptor.shouldCreateAsAssociatedTokenAccount) {
     warnings.recipientAssociatedTokenAccount =
       new SolanaRecipientAssociatedTokenAccountWillBeFunded();
 
-    if (!(await isAccountFunded(tx.recipient, config))) {
+    if (!(await isAccountFunded(tx.recipient, api))) {
       warnings.recipient = new SolanaAccountNotFunded();
     }
   }
@@ -247,11 +239,11 @@ const deriveTokenTransferCommandDescriptor = async (
 async function getTokenRecipient(
   recipientAddress: string,
   mintAddress: string,
-  config: Config
+  api: ChainAPI
 ): Promise<TokenRecipientDescriptor | Error> {
   const recipientTokenAccount = await getMaybeTokenAccount(
     recipientAddress,
-    config
+    api
   );
 
   if (recipientTokenAccount instanceof Error) {
@@ -263,15 +255,12 @@ async function getTokenRecipient(
       return new SolanaAddressOffEd25519();
     }
 
-    const recipientAssociatedTokenAccPubkey =
-      await findAssociatedTokenAccountPubkey(recipientAddress, mintAddress);
-
     const recipientAssociatedTokenAccountAddress =
-      recipientAssociatedTokenAccPubkey.toBase58();
+      await api.findAssocTokenAccAddress(recipientAddress, mintAddress);
 
     const shouldCreateAsAssociatedTokenAccount = !(await isAccountFunded(
       recipientAssociatedTokenAccountAddress,
-      config
+      api
     ));
 
     return {
@@ -298,20 +287,18 @@ async function getTokenRecipient(
 async function deriveCreateAssociatedTokenAccountCommandDescriptor(
   mainAccount: Account,
   model: TransactionModel & { kind: TokenCreateATATransaction["kind"] },
-  config: Config
+  api: ChainAPI
 ): Promise<CommandDescriptor> {
   const token = getTokenById(model.uiState.tokenId);
   const tokenIdParts = token.id.split("/");
   const mint = tokenIdParts[tokenIdParts.length - 1];
 
-  const associatedTokenAccountPubkey = await findAssociatedTokenAccountPubkey(
+  const associatedTokenAccountAddress = await api.findAssocTokenAccAddress(
     mainAccount.freshAddress,
     mint
   );
 
-  const associatedTokenAccountAddress = associatedTokenAccountPubkey.toBase58();
-
-  const fees = await getAssociatedTokenAccountCreationFee(config);
+  const fees = await api.getAssocTokenAccMinNativeBalance();
 
   return {
     status: "valid",
@@ -329,7 +316,7 @@ async function deriveTransaferCommandDescriptor(
   mainAccount: Account,
   tx: Transaction,
   model: TransactionModel & { kind: TransferTransaction["kind"] },
-  config: Config
+  api: ChainAPI
 ): Promise<CommandDescriptor> {
   const errors: Record<string, Error> = {};
   const warnings: Record<string, Error> = {};
@@ -338,10 +325,7 @@ async function deriveTransaferCommandDescriptor(
     warnings.recipientOffCurve = new SolanaAddressOffEd25519();
   }
 
-  const recipientWalletIsUnfunded = !(await isAccountFunded(
-    tx.recipient,
-    config
-  ));
+  const recipientWalletIsUnfunded = !(await isAccountFunded(tx.recipient, api));
   if (recipientWalletIsUnfunded) {
     warnings.recipient = new SolanaAccountNotFunded();
   }
@@ -416,4 +400,17 @@ function updateModelIfSubAccountIdPresent(tx: Transaction): Transaction {
   return tx;
 }
 
-export default prepareTransaction;
+async function isAccountFunded(
+  address: string,
+  api: ChainAPI
+): Promise<boolean> {
+  const balance = await api.getBalance(address);
+  return balance > 0;
+}
+
+async function getTxFeeCalculator(api: ChainAPI) {
+  const { feeCalculator } = await api.getRecentBlockhash();
+  return feeCalculator;
+}
+
+export { prepareTransaction };

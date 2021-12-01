@@ -13,12 +13,12 @@ import type {
   TransferCommand,
   ValidCommandDescriptor,
 } from "./types";
-import { buildOnChainTransaction } from "./js-buildTransaction";
+import { buildTransactionWithAPI } from "./js-buildTransaction";
 import Solana from "@ledgerhq/hw-app-solana";
 import BigNumber from "bignumber.js";
 import { encodeOperationId } from "../../operation";
-import { assertUnreachable, clusterByCurrencyId } from "./utils";
-import { Config } from "./api";
+import { assertUnreachable } from "./utils";
+import { ChainAPI } from "./api";
 
 const buildOptimisticOperation = (
   account: Account,
@@ -44,29 +44,25 @@ const buildOptimisticOperation = (
   }
 };
 
-/**
- * Sign Transaction with Ledger hardware
- */
-const signOperation = ({
-  account,
-  deviceId,
-  transaction,
-}: {
-  account: Account;
-  deviceId: any;
-  transaction: Transaction;
-}): Observable<SignOperationEvent> =>
+export const signOperationWithAPI = (
+  {
+    account,
+    deviceId,
+    transaction,
+  }: {
+    account: Account;
+    deviceId: any;
+    transaction: Transaction;
+  },
+  api: () => Promise<ChainAPI>
+): Observable<SignOperationEvent> =>
   new Observable((subsriber) => {
     const main = async () => {
       const transport = await open(deviceId);
 
-      const config: Config = {
-        cluster: clusterByCurrencyId(account.currency.id),
-      };
-
       try {
         const [msgToHardwareBytes, singOnChainTransaction] =
-          await buildOnChainTransaction(account, transaction, config);
+          await buildTransactionWithAPI(account, transaction, await api());
 
         const hwApp = new Solana(transport);
 
@@ -103,8 +99,6 @@ const signOperation = ({
       (e) => subsriber.error(e)
     );
   });
-
-export default signOperation;
 
 function buildOptimisticOperationForCommand(
   account: Account,
