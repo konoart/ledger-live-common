@@ -1,5 +1,10 @@
 module.exports = {
   parser: "@typescript-eslint/parser",
+  parserOptions: {
+    "ecmaVersion": 2020,
+    //"sourceType": "module",
+    "project": "./src/tsconfig.json" // <-- Point to your project's tsconfig.json or create new one
+  },
   settings: {
     react: { version: "16" },
   },
@@ -19,8 +24,9 @@ module.exports = {
     Atomics: "readonly",
     SharedArrayBuffer: "readonly",
   },
-  plugins: ["@typescript-eslint", "react", "react-hooks", "prettier"],
+  plugins: ["@typescript-eslint", "react", "react-hooks", "prettier", "deprecation"],
   rules: {
+     "deprecation/deprecation": "error",
     "no-console": ["error", { allow: ["warn", "error"] }],
     "linebreak-style": ["error", "unix"],
     semi: ["error", "always"],
